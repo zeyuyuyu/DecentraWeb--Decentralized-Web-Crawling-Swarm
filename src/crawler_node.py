@@ -1,114 +1,63 @@
 import asyncio
-import aiohttp
-from typing import Set, Dict
-import json
 import random
-from dataclasses import dataclass
-from datetime import datetime
-
-@dataclass
-class CrawlResult:
-    url: str
-    timestamp: datetime
-    content: str
-    links: Set[str]
-    metadata: Dict
+from typing import List
+from .web_crawler import WebCrawler
+from .consensus_manager import ConsensusManager
 
 class CrawlerNode:
-    def __init__(self, node_id: str, bootstrap_peers: list[str] = None):
+    def __init__(self, node_id: str, initial_urls: List[str]):
         self.node_id = node_id
-        self.peers = set(bootstrap_peers or [])
-        self.crawled_urls = set()
-        self.results = []
-        self.is_running = False
+        self.crawler = WebCrawler()
+        self.consensus_manager = ConsensusManager(node_id)
+        self.crawl_queue = initial_urls
 
-    async def start(self):
-        self.is_running = True
-        await asyncio.gather(
-            self.peer_discovery_loop(),
-            self.crawl_loop()
-        )
-
-    async def peer_discovery_loop(self):
-        while self.is_running:
-            for peer in list(self.peers):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(f'{peer}/peers') as resp:
-                            if resp.status == 200:
-                                new_peers = await resp.json()
-                                self.peers.update(new_peers)
-                except Exception as e:
-                    self.peers.remove(peer)
-            await asyncio.sleep(60)
-
-    async def crawl_loop(self):
-        async with aiohttp.ClientSession() as session:
-            while self.is_running:
-                if not self.peers:
-                    await asyncio.sleep(5)
-                    continue
-
-                # Get work from random peer
-                peer = random.choice(list(self.peers))
-                try:
-                    async with session.get(f'{peer}/next_url') as resp:
-                        if resp.status == 200:
-                            url = await resp.text()
-                            if url not in self.crawled_urls:
-                                await self.crawl_url(session, url)
-                except Exception:
-                    self.peers.remove(peer)
-                await asyncio.sleep(1)
-
-    async def crawl_url(self, session: aiohttp.ClientSession, url: str):
-        try:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    content = await resp.text()
-                    links = self.extract_links(content)
-                    
-                    result = CrawlResult(
-                        url=url,
-                        timestamp=datetime.utcnow(),
-                        content=content,
-                        links=links,
-                        metadata={
-                            'status': resp.status,
-                            'headers': dict(resp.headers)
-                        }
-                    )
-                    
-                    self.results.append(result)
-                    self.crawled_urls.add(url)
-                    
-                    # Share results with peers
-                    await self.broadcast_result(result)
-        except Exception as e:
-            print(f'Error crawling {url}: {str(e)}')
-
-    def extract_links(self, content: str) -> Set[str]:
-        # TODO: Implement link extraction
-        return set()
-
-    async def broadcast_result(self, result: CrawlResult):
-        payload = {
-            'url': result.url,
-            'timestamp': result.timestamp.isoformat(),
-            'links': list(result.links)
-        }
-        
-        for peer in list(self.peers):
+    async def run(self):
+        while self.crawl_queue:
+            url = self.crawl_queue.pop(0)
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f'{peer}/result',
-                        json=payload
-                    ) as resp:
-                        if resp.status != 200:
-                            self.peers.remove(peer)
-            except Exception:
-                self.peers.remove(peer)
+                pages = await self.crawler.crawl(url)
+                await self.consensus_manager.propose_pages(pages)
+                self.crawl_queue.extend(pages)
+            except Exception as e:
+                print(f'Error crawling {url}: {e}')
 
-    async def stop(self):
-        self.is_running = False
+            await asyncio.sleep(random.uniform(1, 5))
+
+        await self.consensus_manager.shutdown()
+
+class ConsensusManager:
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.peers = []
+        self.page_proposals = {}
+
+    async def propose_pages(self, pages: List[str]):
+        for page in pages:
+            if page not in self.page_proposals:
+                self.page_proposals[page] = {self.node_id: 1}
+                await self.broadcast_proposal(page)
+            else:
+                self.page_proposals[page][self.node_id] = self.page_proposals[page].get(self.node_id, 0) + 1
+                if self.page_proposals[page][self.node_id] >= len(self.peers) // 2 + 1:
+                    await self.finalize_page(page)
+
+    async def broadcast_proposal(self, page: str):
+        for peer in self.peers:
+            await peer.receive_proposal(page, self.node_id)
+
+    async def receive_proposal(self, page: str, proposer_id: str):
+        if page not in self.page_proposals:
+            self.page_proposals[page] = {proposer_id: 1}
+            await self.broadcast_proposal(page)
+        else:
+            self.page_proposals[page][proposer_id] = self.page_proposals[page].get(proposer_id, 0) + 1
+            if self.page_proposals[page][proposer_id] >= len(self.peers) // 2 + 1:
+                await self.finalize_page(page)
+
+    async def finalize_page(self, page: str):
+        print(f'Finalizing page: {page}')
+        # Add page to the global crawl index
+        self.page_proposals.pop(page)
+
+    async def shutdown(self):
+        await asyncio.gather(*[peer.shutdown() for peer in self.peers])
